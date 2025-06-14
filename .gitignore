@@ -1,11 +1,18 @@
-# .gitignore
+# Sensitive files - DO NOT COMMIT!
 .env
+/etc/nginx/ssl/
+*.pem # Catches all .pem files, including private keys
+*.key # Catches all .key files, including private keys
+
+# Python compiled files
 __pycache__/
 *.pyc
-.pytest_cache/
-.mypy_cache/
-.vscode/
-.DS_Store
-*.log
-*.sqlite3
-volumes/
+
+# Virtual environment (if you ever use one locally outside Docker)
+.venv/
+venv/
+env/
+
+# Docker related files
+*.log # General log files
+ volumes/ # Uncomment this if you want to keep Docker volumes out of git (recommended for dev/prod data)
