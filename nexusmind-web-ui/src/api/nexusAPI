@@ -1,0 +1,47 @@
+ts
+
+
+// src/api/nexusAPI.ts
+
+import axios from 'axios';
+import Cookies from 'js-cookie'; // Using js-cookie for simpler cookie handling
+
+const API_BASE_URL: string = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8001';
+
+const nexusAPI = axios.create({
+  baseURL: API_BASE_URL,
+  withCredentials: true, // IMPORTANT: Allows sending/receiving cookies with requests
+});
+
+// Add a request interceptor to automatically add the JWT to every request
+nexusAPI.interceptors.request.use(
+  config => {
+    const token = Cookies.get('access_token'); // Get token from HTTP-only cookie
+    if (token) {
+      config.headers.Authorization = `Bearer ${token}`;
+    }
+    return config;
+  },
+  error => {
+    return Promise.reject(error);
+  }
+);
+
+// Add a response interceptor to handle 401 Unauthorized errors
+nexusAPI.interceptors.response.use(
+  response => response,
+  error => {
+    if (error.response && error.response.status === 401) {
+      // If 401, clear the token and redirect to login
+      Cookies.remove('access_token');
+      localStorage.removeItem('nexus_username'); // Also clear any cached username
+
+      // Using simple event dispatch for AuthProvider to handle redirection
+      const authEvent = new CustomEvent('authError');
+      window.dispatchEvent(authEvent);
+    }
+    return Promise.reject(error);
+  }
+);
+
+export default nexusAPI;
