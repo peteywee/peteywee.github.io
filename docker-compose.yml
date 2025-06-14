@@ -1,8 +1,10 @@
+# /home/patrick/nexus_orchestrator_project/docker-compose.yml
 version: '3.8'
 
 services:
   gpt-nexus:
     build: ./gpt-nexus
+    image: ghcr.io/peteywee/nexus-orchestrator-project2/gpt-nexus:latest # NEW: Image name for GHCR
     ports:
       - "8000:8000"
     depends_on:
@@ -10,7 +12,7 @@ services:
       - postgres
     environment:
       REDIS_HOST: redis
-      REDIS_PORT: 6390
+      REDIS_PORT: 6379
       POSTGRES_HOST: postgres
       POSTGRES_PORT: 5432
       POSTGRES_USER: ${POSTGRES_USER}
@@ -21,14 +23,13 @@ services:
   redis:
     image: "redis:7-alpine"
     ports:
-      - "6390:6390"  # changed both sides: external:internal
-    command: ["redis-server", "--port", "6390"]
+      - "6379:6379"
     volumes:
       - redis_data:/data
     restart: always
 
   postgres:
-    image: "postgres:17-alpine"
+    image: "postgres:14-alpine"
     ports:
       - "5432:5432"
     volumes:
@@ -37,6 +38,50 @@ services:
       POSTGRES_DB: ${POSTGRES_DB}
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    restart: always
+
+  gpt-agent_comms:
+    build: ./gpt-agent_comms
+    image: ghcr.io/peteywee/nexus-orchestrator-project2/gpt-agent-comms:latest # NEW
+    depends_on:
+      - redis
+      - gpt-nexus
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+    restart: always
+
+  gpt-agent_ops_execution:
+    build: ./gpt-agent_ops_execution
+    image: ghcr.io/peteywee/nexus-orchestrator-project2/gpt-agent-ops-execution:latest # NEW
+    depends_on:
+      - redis
+      - gpt-nexus
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+    restart: always
+
+  gpt-agent_research:
+    build: ./gpt-agent_research
+    image: ghcr.io/peteywee/nexus-orchestrator-project2/gpt-agent-research:latest # NEW
+    depends_on:
+      - redis
+      - gpt-nexus
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+    restart: always
+
+  gpt-agent_strategy:
+    build: ./gpt-agent_strategy
+    image: ghcr.io/peteywee/nexus-orchestrator-project2/gpt-agent-strategy:latest # NEW
+    depends_on:
+      - redis
+      - gpt-nexus
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
     restart: always
 
 volumes:
