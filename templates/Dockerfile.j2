@@ -1,0 +1,10 @@
+# {{ agent_id_prefix }}/Dockerfile
+FROM python:3.9-slim-buster
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . .
+{% if agent_id_prefix == "gpt-agent_research" %}
+COPY mock_data/ /app/mock_data/
+{% endif %}
+CMD ["python", "agent_app.py"]

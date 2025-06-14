@@ -1,0 +1,4 @@
+redis
+pydantic
+httpx
+# subprocess is built-in
