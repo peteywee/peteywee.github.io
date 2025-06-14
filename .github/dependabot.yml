@@ -1,0 +1,41 @@
+# .github/dependabot.yml
+
+version: 2
+updates:
+  # Python (pip) dependencies for your main application and agents
+  - package-ecosystem: "pip"
+    directory: "/" # Location of your pyproject.toml or requirements.txt files
+    schedule:
+      interval: "weekly" # Check for updates weekly
+      day: "monday"      # On Mondays
+      time: "09:00"      # At 9:00 AM UTC (adjust as needed)
+    open-pull-requests-limit: 10 # Limit the number of open PRs to avoid overwhelming you
+    # Optional: Group common development dependencies if you have a dev requirements file
+    # groups:
+    #   development-dependencies:
+    #     patterns:
+    #       - "pytest"
+    #       - "flake8"
+
+  # Docker dependencies for your Dockerfiles
+  - package-ecosystem: "docker"
+    directory: "/" # Look for Dockerfiles in the root and subdirectories
+    schedule:
+      interval: "monthly" # Check for updates monthly for base images
+    open-pull-requests-limit: 5
+    # Optional: You can specify a Dockerfile explicitly if needed
+    # dockerfile-path: "./path/to/your/Dockerfile"
+
+  # GitHub Actions workflow dependencies
+  - package-ecosystem: "github-actions"
+    directory: "/" # Look for workflow files in .github/workflows/
+    schedule:
+      interval: "monthly" # Check for updates to GitHub Actions versions monthly
+    open-pull-requests-limit: 3
+
+  # Optional: JavaScript/TypeScript dependencies if you build a frontend later
+  # - package-ecosystem: "npm" # Or "yarn"
+  #   directory: "/frontend" # Path to your package.json
+  #   schedule:
+  #     interval: "weekly"
+  #   open-pull-requests-limit: 10
