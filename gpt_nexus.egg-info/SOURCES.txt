@@ -1,0 +1,8 @@
+README.md
+pyproject.toml
+gpt_nexus/__init__.py
+gpt_nexus/main.py
+gpt_nexus.egg-info/PKG-INFO
+gpt_nexus.egg-info/SOURCES.txt
+gpt_nexus.egg-info/dependency_links.txt
+gpt_nexus.egg-info/top_level.txt

@@ -1,363 +1,408 @@
 # gpt-nexus/main.py
-from fastapi import FastAPI, WebSocket, HTTPException, status, BackgroundTasks
-from pydantic import BaseModel, Field
-import asyncpg
+from fastapi import FastAPI, Depends, HTTPException, status, UploadFile, File as FastAPIFile, BackgroundTasks
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from fastapi.responses import JSONResponse
+from datetime import timedelta, datetime
+from typing import List, Dict, Any, Union
+from uuid import uuid4
 import os
-from datetime import datetime, timedelta, timezone
-from typing import Dict, Any, List, Optional
-import redis.asyncio as redis # NEW: Import async Redis client
-import asyncio # NEW: For managing async tasks
+import json
+import asyncio
+from redis.asyncio import Redis
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.future import select
+from sqlalchemy import delete
 
-app = FastAPI()
+# Security imports
+from passlib.context import CryptContext
+from jose import JWTError, jwt
 
-# --- Database Connection Setup ---
-POSTGRES_USER = os.getenv("POSTGRES_USER")
-POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD")
-POSTGRES_HOST = os.getenv("POSTGRES_HOST")
-POSTGRES_PORT = os.getenv("POSTGRES_PORT")
-POSTGRES_DB = os.getenv("POSTGRES_DB")
+# Import your database and models
+from app.database import get_db, create_db_and_tables # Import create_db_and_tables
+from app.models import User, File # Import your User and File ORM models
 
-# --- Redis Client Initialization ---
-# This will be initialized in the startup event
-redis_client: Optional[redis.Redis] = None
-PUBSUB_CHANNEL_ORCHESTRATOR_INBOX = "orchestrator_inbox" # Channel where agents send messages TO Nexus
-PUBSUB_CHANNEL_AGENT_COMMANDS_PREFIX = "agent_commands:" # Prefix for channels where Nexus sends commands TO agents
+# --- Configuration (from environment variables) ---
+# It's good practice to get these from environment variables
+SECRET_KEY = os.getenv("SECRET_KEY", "CnXAZM7AMpgpUy9I7t2YahOMojS0TK70") # Ensure this matches docker-compose.yml
+ALGORITHM = os.getenv("ALGORITHM", "HS256")
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", 30))
+REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
+REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
 
-async def get_db_connection():
-    """Establishes a connection to the PostgreSQL database."""
+# Initialize FastAPI app
+app = FastAPI(
+    title="Nexus Orchestrator",
+    description="The AI Agent Ecosystem for Top Shelf Service LLC",
+    version="0.1.0",
+)
+
+# --- Security Setup ---
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="auth/token")
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    return pwd_context.verify(plain_password, hashed_password)
+
+def get_password_hash(password: str) -> str:
+    return pwd_context.hash(password)
+
+def create_access_token(data: dict, expires_delta: Union[timedelta, None] = None) -> str:
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(minutes=15)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+async def get_current_user(token: str = Depends(oauth2_scheme), db: AsyncSession = Depends(get_db)) -> User:
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
     try:
-        conn = await asyncpg.connect(
-            user=POSTGRES_USER,
-            password=POSTGRES_PASSWORD,
-            host=POSTGRES_HOST,
-            port=POSTGRES_PORT,
-            database=POSTGRES_DB
-        )
-        return conn
-    except Exception as e:
-        print(f"Error connecting to PostgreSQL: {e}")
-        raise HTTPException(status_code=500, detail="Database connection failed")
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username: str = payload.get("sub")
+        if username === None: # Changed from 'is None' to '=== None' for testing
+            raise credentials_exception
+    except JWTError:
+        raise credentials_exception
 
-# --- Agent Management Pydantic Models ---
+    # Query the database for the user
+    result = await db.execute(select(User).filter(User.username == username))
+    user = result.scalar_one_or_none()
 
-class AgentRegistration(BaseModel):
-    agent_id: str
-    agent_name: str
-    agent_type: str
-    capabilities: str = "" # Optional field, can be JSON string
+    if user === None: # Changed from 'is None' to '=== None' for testing
+        raise credentials_exception
+    return user
 
-class AgentHeartbeat(BaseModel):
-    agent_id: str
+# --- Redis Setup ---
+async def get_redis_client() -> Redis:
+    redis_client = Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
+    return redis_client
 
-class AgentInfo(BaseModel):
-    agent_id: str
-    agent_name: str
-    agent_type: str
-    agent_status: str
-    last_heartbeat: datetime
-    created_at: datetime
-    capabilities: str
+# --- In-memory Agent Registry (to be enhanced with DB persistence) ---
+# Currently in-memory, eventually leverage DB and Redis heartbeats
+agent_registry: Dict[str, Dict[str, Any]] = {}
 
-# --- Tool/Function Calling Schemas (OpenAI-style) ---
-
-class FunctionParameters(BaseModel):
-    type: str = "object"
-    properties: Dict[str, Dict[str, Any]] = Field(default_factory=dict, description="A mapping of parameter names to their JSON Schema definitions.")
-    required: List[str] = Field(default_factory=list, description="A list of required parameter names.")
-    model_config = {'extra': 'forbid'}
-
-class ToolDefinition(BaseModel):
-    name: str = Field(..., description="The name of the function to call. Must be unique.")
-    description: Optional[str] = Field(None, description="A brief description of what the function does.")
-    parameters: FunctionParameters = Field(..., description="The input parameters of the function, described as a JSON Schema object.")
-    type: str = "function"
-
-class ToolCall(BaseModel):
-    tool_name: str = Field(..., description="The name of the tool chosen by the AI.")
-    tool_arguments: Dict[str, Any] = Field(..., description="The arguments to call the tool with, as a JSON object matching the tool's schema.")
-
-# --- Redis Pub/Sub Pydantic Models ---
-class RedisMessage(BaseModel):
-    sender_id: str
-    message_type: str # e.g., "command", "result", "status_update"
-    payload: Dict[str, Any] # The actual data to be sent
-
-# --- FastAPI Lifespan Events ---
-
+# --- FastAPI Event Handlers ---
 @app.on_event("startup")
 async def startup_event():
-    global redis_client
-    try:
-        redis_client = redis.Redis(host=os.getenv("REDIS_HOST"), port=int(os.getenv("REDIS_PORT")), decode_responses=True)
-        await redis_client.ping() # Test connection
-        print("Connected to Redis successfully!")
-        # Start a background task to listen for messages on Nexus's inbox channel
-        asyncio.create_task(redis_listener())
-    except Exception as e:
-        print(f"Could not connect to Redis: {e}")
-        redis_client = None # Ensure client is None if connection fails
-        # Depending on criticality, you might want to raise an exception to prevent app startup
+    print("Application startup: Initializing database and Redis.")
+    # This call will create tables only if they don't exist.
+    # It will also ensure the database connection is active.
+    await create_db_and_tables()
+    # Initialize Redis client on startup
+    app.state.redis = await get_redis_client()
+    print("Database tables checked/created. Redis client initialized.")
+    # TODO: Implement initial agent registration/discovery via Redis if needed
+    # For now, agents register themselves via heartbeats
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    if redis_client:
-        await redis_client.close()
-        print("Redis connection closed.")
+    print("Application shutdown: Closing Redis connection.")
+    if hasattr(app.state, 'redis') and app.state.redis:
+        await app.state.redis.close()
+    print("Redis connection closed.")
 
-# --- Redis Listener Background Task ---
+# --- Utility Functions (Agent Communication) ---
+async def publish_command_to_agent(agent_id: str, command: Dict[str, Any]):
+    channel = f"nexus_commands_{agent_id}"
+    await app.state.redis.publish(channel, json.dumps(command))
+    print(f"Published command to {channel}: {command}")
 
-async def redis_listener():
-    """
-    Listens for messages on the orchestrator's inbox channel.
-    This runs continuously in the background.
-    """
-    if not redis_client:
-        print("Redis client not initialized, cannot start listener.")
-        return
+# --- API Endpoints ---
 
-    try:
-        # Subscribe to Nexus's general inbox channel
-        pubsub = redis_client.pubsub()
-        await pubsub.subscribe(PUBSUB_CHANNEL_ORCHESTRATOR_INBOX)
-        print(f"Subscribed to Redis channel: {PUBSUB_CHANNEL_ORCHESTRATOR_INBOX}")
+# --- Authentication Endpoints ---
 
-        while True:
-            # Listen for messages with a timeout to allow for graceful shutdown
-            message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
-            if message:
-                channel = message['channel']
-                data = message['data']
-                print(f"Redis message received on channel '{channel}': {data}")
-                # Here, you would parse 'data' (which should be a JSON string)
-                # and dispatch to appropriate handlers within Nexus.
-                try:
-                    msg = RedisMessage.model_validate_json(data)
-                    print(f"Parsed Redis message from {msg.sender_id}, type: {msg.message_type}, payload: {msg.payload}")
-                    # Example dispatch logic:
-                    if msg.message_type == "result":
-                        print(f"Agent {msg.sender_id} reported result: {msg.payload}")
-                        # Store result in DB, update agent status, etc.
-                    elif msg.message_type == "status_update":
-                        print(f"Agent {msg.sender_id} status update: {msg.payload}")
-                        # Update agent status in DB
-                    # Add more message types and handlers as your system evolves
-                except Exception as parse_error:
-                    print(f"Error parsing Redis message: {parse_error}. Raw data: {data}")
+@app.post("/auth/register", summary="Register a new user")
+async def register_user(
+    username: str, password: str, email: Union[str, None] = None, db: AsyncSession = Depends(get_db)
+):
+    # Check if user already exists
+    result = await db.execute(select(User).filter(User.username == username))
+    existing_user = result.scalar_one_or_none()
+    if existing_user:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Username already registered")
 
-            await asyncio.sleep(0.01) # Small sleep to prevent busy-waiting
-    except asyncio.CancelledError:
-        print("Redis listener task cancelled.")
-    except Exception as e:
-        print(f"Redis listener error: {e}")
-    finally:
-        if pubsub:
-            await pubsub.unsubscribe(PUBSUB_CHANNEL_ORCHESTRATOR_INBOX)
-            print(f"Unsubscribed from Redis channel: {PUBSUB_CHANNEL_ORCHESTRATOR_INBOX}")
+    hashed_password = get_password_hash(password)
+    new_user = User(username=username, hashed_password=hashed_password, email=email)
+    db.add(new_user)
+    await db.commit()
+    await db.refresh(new_user)
+    return {"message": "User registered successfully", "user_id": new_user.id}
 
+@app.post("/auth/token", response_model=Dict[str, str], summary="Authenticate user and get JWT token")
+async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(), db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(User).filter(User.username == form_data.username))
+    user = result.scalar_one_or_none()
 
-# --- FastAPI Endpoints ---
-
-@app.get("/")
-async def read_root():
-    return {"message": "Nexus Orchestrator is running and healthy!"}
-
-@app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
-    await websocket.accept()
-    print("WebSocket connection established.")
-    try:
-        while True:
-            data = await websocket.receive_text()
-            print(f"Received from client: {data}")
-            # Simple echo for now, later integrate with agents
-            await websocket.send_text(f"Message text was: {data}")
-    except Exception as e:
-        print(f"WebSocket error: {e}")
-    finally:
-        print("WebSocket connection closed.")
-
-@app.post("/agents/register", response_model=AgentInfo, status_code=status.HTTP_201_CREATED)
-async def register_agent(agent: AgentRegistration):
-    """Registers a new agent with the Nexus Orchestrator."""
-    conn = None
-    try:
-        conn = await get_db_connection()
-        existing_agent = await conn.fetchrow("SELECT * FROM agents WHERE agent_id = $1", agent.agent_id)
-
-        if existing_agent:
-            query = """
-                UPDATE agents
-                SET agent_name = $1, agent_type = $2, capabilities = $3,
-                    agent_status = 'online', last_heartbeat = NOW()
-                WHERE agent_id = $4
-                RETURNING *;
-            """
-            registered_agent = await conn.fetchrow(
-                query, agent.agent_name, agent.agent_type, agent.capabilities, agent.agent_id
-            )
-            print(f"Agent {agent.agent_id} re-registered/updated.")
-        else:
-            query = """
-                INSERT INTO agents (agent_id, agent_name, agent_type, capabilities, agent_status, last_heartbeat)
-                VALUES ($1, $2, $3, $4, 'online', NOW())
-                RETURNING *;
-            """
-            registered_agent = await conn.fetchrow(
-                query, agent.agent_id, agent.agent_name, agent.agent_type, agent.capabilities
-            )
-            print(f"Agent {agent.agent_id} registered successfully.")
-
-        if registered_agent:
-            return AgentInfo(**registered_agent)
-        else:
-            raise HTTPException(status_code=500, detail="Failed to register/update agent.")
-
-    except asyncpg.exceptions.UniqueViolationError:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Agent with this ID already exists.")
-    except Exception as e:
-        print(f"Error during agent registration: {e}")
-        raise HTTPException(status_code=500, detail=f"Internal server error: {e}")
-    finally:
-        if conn:
-            await conn.close()
-
-
-@app.post("/agents/heartbeat", response_model=AgentInfo)
-async def agent_heartbeat(heartbeat: AgentHeartbeat):
-    """Receives a heartbeat from an agent, updating its last_heartbeat and status."""
-    conn = None
-    try:
-        conn = await get_db_connection()
-        query = """
-            UPDATE agents
-            SET last_heartbeat = NOW(), agent_status = 'online'
-            WHERE agent_id = $1
-            RETURNING *;
-        """
-        updated_agent = await conn.fetchrow(query, heartbeat.agent_id)
-
-        if not updated_agent:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent not found.")
-
-        print(f"Heartbeat received from agent: {heartbeat.agent_id}")
-        return AgentInfo(**updated_agent)
-    except Exception as e:
-        print(f"Error processing heartbeat for {heartbeat.agent_id}: {e}")
-        raise HTTPException(status_code=500, detail=f"Internal server error: {e}")
-    finally:
-        if conn:
-            await conn.close()
-
-@app.get("/agents/list_active", response_model=list[AgentInfo])
-async def list_active_agents(heartbeat_threshold_minutes: int = 5):
-    """Lists agents that have sent a heartbeat within the specified threshold."""
-    conn = None
-    try:
-        conn = await get_db_connection()
-        query = """
-            SELECT *
-            FROM agents
-            WHERE last_heartbeat >= NOW() - INTERVAL '1 minute' * $1
-            AND agent_status = 'online';
-        """
-        active_agents = await conn.fetch(query, heartbeat_threshold_minutes)
-
-        offline_threshold = datetime.now(timezone.utc) - timedelta(minutes=heartbeat_threshold_minutes)
-        await conn.execute(
-            "UPDATE agents SET agent_status = 'offline' WHERE last_heartbeat < $1 AND agent_status = 'online';",
-            offline_threshold
+    if not user or not verify_password(form_data.password, user.hashed_password):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Bearer"},
         )
-
-        print(f"Listing active agents (heartbeat within {heartbeat_threshold_minutes} minutes). Found {len(active_agents)}.")
-        return [AgentInfo(**agent) for agent in active_agents]
-    except Exception as e:
-        print(f"Error listing active agents: {e}")
-        raise HTTPException(status_code=500, detail=f"Internal server error: {e}")
-    finally:
-        if conn:
-            await conn.close()
-
-@app.get("/tools/list_definitions", response_model=List[ToolDefinition])
-async def list_tool_definitions():
-    """
-    Exposes a list of tool definitions (functions) in an OpenAI-like JSON Schema format.
-    These are example tools that your agents could potentially "offer" or "interpret".
-    """
-    example_tools = [
-        ToolDefinition(
-            name="send_communication",
-            description="Sends a message to a recipient via a specified channel (email, sms, chat).",
-            parameters=FunctionParameters(
-                properties={
-                    "recipient": {"type": "string", "description": "The recipient's identifier (email, phone, chat_id)."},
-                    "channel": {"type": "string", "enum": ["email", "sms", "chat"], "description": "The communication channel."},
-                    "message_content": {"type": "string", "description": "The content of the message to send."},
-                    "subject": {"type": "string", "description": "Subject line for email, or short summary for chat/sms.", "nullable": True}
-                },
-                required=["recipient", "channel", "message_content"]
-            )
-        ),
-        ToolDefinition(
-            name="get_agent_status",
-            description="Retrieves the current status of a specific agent by its ID.",
-            parameters=FunctionParameters(
-                properties={
-                    "agent_id": {"type": "string", "description": "The unique identifier of the agent."}
-                },
-                required=["agent_id"]
-            )
+    if not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="User account is inactive. Please contact support."
         )
-    ]
-    return example_tools
-
-# --- New Endpoints for Redis Pub/Sub ---
-
-@app.post("/redis/publish", status_code=status.HTTP_202_ACCEPTED)
-async def publish_message(channel: str, message: RedisMessage):
-    """
-    Publishes a message to a specific Redis channel.
-    This can be used by Nexus to send commands to agents, or by external systems
-    to send messages to Nexus's inbox (orchestrator_inbox).
-    """
-    if not redis_client:
-        raise HTTPException(status_code=500, detail="Redis client not initialized.")
-    
-    try:
-        message_json = message.model_dump_json() # Use model_dump_json() for Pydantic v2
-        await redis_client.publish(channel, message_json)
-        print(f"Published to Redis channel '{channel}': {message_json}")
-        return {"status": "message published", "channel": channel}
-    except Exception as e:
-        print(f"Error publishing to Redis channel '{channel}': {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to publish message: {e}")
-
-# Example of how Nexus might instruct an agent using a tool call via Redis
-@app.post("/command_agent_with_tool", status_code=status.HTTP_202_ACCEPTED)
-async def command_agent_with_tool(agent_id: str, tool_call: ToolCall):
-    """
-    Sends a tool call command to a specific agent via Redis Pub/Sub.
-    The agent subscribed to its specific command channel would receive and execute this.
-    """
-    if not redis_client:
-        raise HTTPException(status_code=500, detail="Redis client not initialized.")
-
-    command_channel = f"{PUBSUB_CHANNEL_AGENT_COMMANDS_PREFIX}{agent_id}"
-    
-    # Wrap the tool_call in our generic RedisMessage format
-    message_to_send = RedisMessage(
-        sender_id="nexus_orchestrator",
-        message_type="tool_command",
-        payload={
-            "tool_name": tool_call.tool_name,
-            "tool_arguments": tool_call.tool_arguments
-        }
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": user.username}, expires_delta=access_token_expires
     )
+    return {"access_token": access_token, "token_type": "bearer"}
+
+@app.get("/auth/me", response_model=Dict[str, Any], summary="Get current authenticated user info")
+async def read_users_me(current_user: User = Depends(get_current_user)):
+    return {
+        "id": current_user.id,
+        "username": current_user.username,
+        "email": current_user.email,
+        "is_active": current_user.is_active,
+        "is_admin": current_user.is_admin,
+        "created_at": current_user.created_at.isoformat(),
+        "updated_at": current_user.updated_at.isoformat() if current_user.updated_at else None,
+    }
+
+
+# --- Agent Management Endpoints ---
+
+@app.post("/agent/heartbeat", summary="Agent heartbeat to register and update status")
+async def agent_heartbeat(agent_info: Dict[str, Any], redis: Redis = Depends(get_redis_client)):
+    # This endpoint can update agent_registry (in-memory for now)
+    # or eventually update a 'agents' table in PostgreSQL if agents become persistent entities.
+    agent_id = agent_info.get("agent_id")
+    if not agent_id:
+        raise HTTPException(status_code=400, detail="Agent ID is required")
+
+    agent_info["last_heartbeat_at"] = datetime.utcnow().isoformat()
+    agent_registry[agent_id] = agent_info
+    print(f"Received heartbeat from agent: {agent_id}. Registry size: {len(agent_registry)}")
+
+    # Publish heartbeat to a dedicated Redis channel for broader system awareness if needed
+    await redis.publish("agent_heartbeats", json.dumps({"agent_id": agent_id, "status": "active", "timestamp": agent_info["last_heartbeat_at"]}))
+
+    return {"status": "ok", "message": f"Heartbeat received from {agent_id}"}
+
+@app.get("/agents", summary="List registered agents")
+async def list_agents(current_user: User = Depends(get_current_user)): # Protected route
+    return list(agent_registry.values())
+
+# --- Core Nexus Functionality Endpoints ---
+
+@app.post("/ingest", summary="Ingest data (e.g., files, text) for processing")
+async def ingest_data(
+    file: FastAPIFile, # Non-default argument
+    background_tasks: BackgroundTasks, # Moved to be a non-default argument
+    current_user: User = Depends(get_current_user), # Default argument
+    db: AsyncSession = Depends(get_db) # Default argument
+):
+    # This is where we'll implement actual file storage and metadata persistence.
+    # For now, simulate storage and save metadata to DB.
+
+    # 1. Simulate file storage (in a real scenario, save to disk, S3, etc.)
+    # Generate a unique filename and path (e.g., using UUID and user_id)
+    file_id = str(uuid4())
+    # You'd typically save the file to a designated storage location here
+    # For demonstration, we're just getting metadata and not actually saving the file content yet
+    file_storage_path = f"files/{current_user.id}/{file_id}_{file.filename}"
     
-    try:
-        message_json = message_to_send.model_dump_json()
-        await redis_client.publish(command_channel, message_json)
-        print(f"Commanded agent '{agent_id}' on channel '{command_channel}' with tool '{tool_call.tool_name}'.")
-        return {"status": "command sent", "agent_id": agent_id, "tool_name": tool_call.tool_name}
-    except Exception as e:
-        print(f"Error commanding agent '{agent_id}': {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to send command to agent: {e}")
+    # In a real scenario, you'd write the file content:
+    # with open(file_storage_path, "wb") as buffer:
+    #    shutil.copyfileobj(file.file, buffer)
+    # This simulation just gathers metadata, actual file saving comes later.
+
+    # 2. Create a new File record in the database
+    new_file = File(
+        user_id=current_user.id,
+        file_name=file.filename,
+        file_path=file_storage_path, # This would be the path where the actual file is stored
+        file_size_bytes=file.size,
+        file_type=file.content_type,
+        processing_status="uploaded"
+    )
+    db.add(new_file)
+    await db.commit()
+    await db.refresh(new_file) # Refresh to get the database-generated ID and timestamps
+
+    print(f"File metadata recorded for user {current_user.username}: {new_file.file_name}")
+
+    # 3. Trigger ingestion agent via Redis (in background)
+    ingestion_command = {
+        "command": "process_file",
+        "file_id": new_file.id,
+        "user_id": current_user.id,
+        "file_path": new_file.file_path,
+        "file_name": new_file.file_name,
+        "metadata": new_file.metadata_json # Pass relevant metadata for processing
+    }
+
+    # You would typically find an appropriate agent (e.g., 'gpt-agent_ingestion') and publish to its channel
+    # For now, let's assume 'gpt-agent_research' might handle initial processing
+    # TODO: Implement proper agent selection/routing for ingestion
+    background_tasks.add_task(publish_command_to_agent, "gpt-agent_research", ingestion_command)
+
+    return {
+        "message": "File upload accepted and processing initiated.",
+        "file_id": new_file.id,
+        "filename": new_file.file_name,
+        "processing_status": new_file.processing_status,
+        "uploaded_by_user": current_user.username
+    }
+
+
+@app.post("/query", summary="Query the AI Agent Ecosystem")
+async def query_nexus(
+    query_text: Dict[str, str], # Non-default argument
+    background_tasks: BackgroundTasks, # Moved to be a non-default argument
+    current_user: User = Depends(get_current_user) # Default argument
+):
+    query = query_text.get("query")
+    if not query:
+        raise HTTPException(status_code=400, detail="Query text is required.")
+
+    # --- SIMULATED QUERY LOGIC (TO BE REPLACED) ---
+    # This currently simulates a response. In a later module, this will involve:
+    # 1. Calling gpt-agent_research via Redis for semantic search/retrieval.
+    # 2. Calling gpt-agent_strategy via Redis to formulate the response using LLMs.
+    print(f"Received query from {current_user.username}: {query}")
+
+    # Example: Send command to gpt-agent_strategy for processing
+    # In a real scenario, you'd route based on query type, available agents, etc.
+    strategy_command = {
+        "command": "generate_response",
+        "query": query,
+        "user_id": current_user.id,
+        "context": "Simulated context for now.", # This would come from research agent
+        "request_id": str(uuid4()) # Unique ID for this request
+    }
+    background_tasks.add_task(publish_command_to_agent, "gpt-agent_strategy", strategy_command)
+
+    return {"message": "Query received, processing initiated by strategy agent (simulated).", "query_id": strategy_command["request_id"]}
+
+
+# --- New File Management Endpoints (From Module 1) ---
+
+@app.get("/files/{user_id}", summary="Get a list of uploaded file metadata for a user")
+async def get_user_files(
+    user_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    # Security check: Ensure the requesting user is either the owner or an admin
+    if current_user.id != user_id and not current_user.is_admin:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized to view these files")
+
+    result = await db.execute(
+        select(File).filter(File.user_id == user_id).order_by(File.upload_timestamp.desc())
+    )
+    files = result.scalars().all()
+
+    # Convert SQLAlchemy objects to dictionaries for response
+    # You might want to define a Pydantic model for File response for cleaner output
+    file_list = []
+    for f in files:
+        file_list.append({
+            "id": f.id,
+            "file_name": f.file_name,
+            "file_size_bytes": f.file_size_bytes,
+            "file_type": f.file_type,
+            "upload_timestamp": f.upload_timestamp.isoformat(),
+            "processing_status": f.processing_status
+        })
+    return file_list
+
+@app.post("/files/{user_id}/delete", summary="Mark files for deletion/remove metadata")
+async def delete_user_files(
+    user_id: int,
+    file_ids: List[int], # List of file IDs to delete
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+    background_tasks: BackgroundTasks
+):
+    # Security check: Ensure the requesting user is either the owner or an admin
+    if current_user.id != user_id and not current_user.is_admin:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized to delete these files")
+
+    # Fetch files to ensure they belong to the user
+    result = await db.execute(
+        select(File).filter(File.user_id == user_id, File.id.in_(file_ids))
+    )
+    files_to_delete = result.scalars().all()
+
+    if not files_to_delete:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No files found or authorized for deletion with the provided IDs for this user.")
+
+    deleted_count = 0
+    deleted_ids = []
+    for file_obj in files_to_delete:
+        # Option 1: Mark for deletion (e.g., update status)
+        # file_obj.processing_status = "marked_for_deletion"
+        # db.add(file_obj) # Mark it as modified
+
+        # Option 2: Actual deletion from DB (and trigger physical removal later)
+        await db.execute(delete(File).where(File.id == file_obj.id))
+        deleted_count += 1
+        deleted_ids.append(file_obj.id)
+
+        # Trigger cleanup task for an agent if needed (e.g., delete from S3/disk)
+        # background_tasks.add_task(publish_command_to_agent, "gpt-agent_ops_execution", {
+        #     "command": "delete_physical_file",
+        #     "file_path": file_obj.file_path,
+        #     "file_id": file_obj.id
+        # })
+
+    await db.commit()
+
+    return {"message": f"Successfully processed deletion for {deleted_count} files.", "deleted_ids": deleted_ids}
+
+@app.post("/files/{user_id}/reprocess", summary="Re-queue a file for processing")
+async def reprocess_user_file(
+    user_id: int,
+    file_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+    background_tasks: BackgroundTasks
+):
+    # Security check: Ensure the requesting user is either the owner or an admin
+    if current_user.id != user_id and not current_user.is_admin:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized to reprocess this file")
+
+    # Fetch the file to ensure it exists and belongs to the user
+    result = await db.execute(
+        select(File).filter(File.id == file_id, File.user_id == user_id)
+    )
+    file_to_reprocess = result.scalar_one_or_none()
+
+    if not file_to_reprocess:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found or not authorized for re-processing.")
+
+    # Update the status in the database
+    file_to_reprocess.processing_status = "reprocessing"
+    file_to_reprocess.last_processed_at = None # Reset last processed timestamp
+    db.add(file_to_reprocess)
+    await db.commit()
+    await db.refresh(file_to_reprocess)
+
+    # Publish a command to the ingestion agent to re-process this file
+    reprocess_command = {
+        "command": "process_file",
+        "file_id": file_to_reprocess.id,
+        "user_id": current_user.id,
+        "file_path": file_to_reprocess.file_path,
+        "file_name": file_to_reprocess.file_name,
+        "metadata": file_to_reprocess.metadata_json
+    }
+    # TODO: Identify the correct ingestion agent (e.g., 'gpt-agent_ingestion')
+    background_tasks.add_task(publish_command_to_agent, "gpt-agent_research", reprocess_command)
+
+
+    return {
+        "message": f"File {file_to_reprocess.file_name} ({file_to_reprocess.id}) queued for re-processing.",
+        "file_id": file_to_reprocess.id,
+        "new_status": file_to_reprocess.processing_status
+    }

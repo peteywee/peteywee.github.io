@@ -1,0 +1,71 @@
+# agent_config.yaml
+
+environment: production
+
+orchestrator:
+  host: "http://nexus:8000"
+  healthcheck: "/health"
+  auth_token: "${ORCHESTRATOR_SECRET}"  # Inject via .env or secrets
+
+agents:
+  - name: gpt-agent-comms
+    role: "communications"
+    endpoint: "/agents/comms"
+    script: "agent_app.py"
+    autostart: true
+    retries: 3
+    depends_on:
+      - redis
+      - nexus
+
+  - name: gpt-agent-ops-execution
+    role: "operations"
+    endpoint: "/agents/ops"
+    script: "agent_app.py"
+    autostart: true
+    retries: 3
+    depends_on:
+      - nexus
+
+  - name: gpt-agent-research
+    role: "research"
+    endpoint: "/agents/research"
+    script: "agent_app.py"
+    autostart: true
+    retries: 3
+    depends_on:
+      - nexus
+
+  - name: gpt-agent-strategy
+    role: "strategy"
+    endpoint: "/agents/strategy"
+    script: "agent_app.py"
+    autostart: true
+    retries: 3
+    depends_on:
+      - gpt-agent-research
+      - nexus
+
+services:
+  redis:
+    host: "redis"
+    port: 6379
+
+  postgres:
+    host: "db"
+    port: 5432
+    db_name: "nexus_db"
+    username: "patrick"
+    password: "${POSTGRES_PASSWORD}"  # Inject securely
+
+logging:
+  level: "INFO"
+  file: "/var/log/nexus/orchestrator.log"
+  json: true
+
+security:
+  rate_limit_per_minute: 100
+  token_expiry_minutes: 60
+  allowed_origins:
+    - "https://yourdomain.com"
+    - "http://localhost:8000"

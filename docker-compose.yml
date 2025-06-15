@@ -1,0 +1,103 @@
+# docker-compose.yml
+version: '3.8'
+
+services:
+  nexus: # This is your FastAPI application service
+    build: ./gpt-nexus # Path to your gpt-nexus Dockerfile context
+    ports:
+      - "8000:8000"
+    environment:
+      # --- IMPORTANT: Configure your database credentials and secret key here ---
+      # Ensure 'db' (hostname) matches the postgres service name below
+      # Ensure 'postgres' (user) and 'YOUR_ACTUAL_SECURE_PASSWORD' match the POSTGRES_USER/PASSWORD in the db service
+      DATABASE_URL: postgresql+asyncpg://postgres:perry101@db:5432/nexusdb
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      SECRET_KEY: "CnXAZM7AMpgpUy9I7t2YahOMojS0TK70" # REPLACE WITH THE KEY YOU GENERATED EARLIER
+      ALGORITHM: "HS256"
+      ACCESS_TOKEN_EXPIRE_MINUTES: 30
+      # -----------------------------------------------------------------------
+    depends_on:
+      - db # The FastAPI app depends on the database
+      - redis
+    networks:
+      - nexus-network
+    restart: on-failure
+
+  db: # Your PostgreSQL database service
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: nexusdb
+      POSTGRES_USER: patrick # This is the default superuser for postgres:14-alpine
+      POSTGRES_PASSWORD: perry101 # <--- REPLACE THIS WITH A REAL, SECURE PASSWORD
+    volumes:
+      - postgres_data:/var/lib/postgresql/data # This volume will be created fresh if it doesn't exist
+    networks:
+      - nexus-network
+    restart: always
+
+  redis: # Your Redis message broker service
+    image: redis:7-alpine
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data # Persistent data for Redis
+    networks:
+      - nexus-network
+    restart: always
+
+  # --- Your AI Agent Services (Examples) ---
+  # Ensure these paths are correct for your project structure
+  gpt-agent-comms:
+    build: ./gpt-agent_comms
+    environment:
+      REDIS_HOST: redis
+    depends_on:
+      - redis
+      - nexus # Agents depend on Nexus (FastAPI app)
+    networks:
+      - nexus-network
+    restart: on-failure
+
+  gpt-agent-ops-execution:
+    build: ./gpt-agent_ops_execution
+    environment:
+      REDIS_HOST: redis
+    depends_on:
+      - redis
+      - nexus
+    networks:
+      - nexus-network
+    restart: on-failure
+
+  gpt-agent-research:
+    build: ./gpt-agent_research
+    environment:
+      REDIS_HOST: redis
+    depends_on:
+      - redis
+      - nexus
+    networks:
+      - nexus-network
+    restart: on-failure
+
+  gpt-agent-strategy:
+    build: ./gpt-agent_strategy
+    environment:
+      REDIS_HOST: redis
+    depends_on:
+      - redis
+      - nexus
+    networks:
+      - nexus-network
+    restart: on-failure
+
+  # You may have other services like Nginx or a frontend container here.
+  # If so, ensure they are also included.
+
+volumes:
+  postgres_data: # Define the named volume for PostgreSQL data
+  redis_data: # Define the named volume for Redis data
+
+networks:
+  nexus-network:
+    driver: bridge # Define the custom network for inter-service communication

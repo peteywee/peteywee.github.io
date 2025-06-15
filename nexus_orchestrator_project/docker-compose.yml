@@ -1,0 +1,20 @@
+
+  gpt-agent-comms:
+    build:
+      context: ./agents/gpt-agent-comms
+    container_name: nexus_orchestrator_project_gpt-agent-comms
+
+  gpt-agent-ops-execution:
+    build:
+      context: ./agents/gpt-agent-ops-execution
+    container_name: nexus_orchestrator_project_gpt-agent-ops-execution
+
+  gpt-agent-strategy:
+    build:
+      context: ./agents/gpt-agent-strategy
+    container_name: nexus_orchestrator_project_gpt-agent-strategy
+
+  gpt-agent-research:
+    build:
+      context: ./agents/gpt-agent-research
+    container_name: nexus_orchestrator_project_gpt-agent-research

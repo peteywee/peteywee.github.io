@@ -1,0 +1,4 @@
+name: default-agent
+id: auto-generated
+metadata:
+  description: Example config for baked agents

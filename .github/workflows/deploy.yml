@@ -75,27 +75,19 @@ jobs:
           docker push ghcr.io/${{ env.GHCR_OWNER }}/${{ env.GHCR_REPO }}/gpt-agent-strategy:latest
 
       - name: Deploy to DigitalOcean Droplet
-        uses: appleboy/ssh-action@master # Action to run commands over SSH
+        uses: appleboy/ssh-action@master
         with:
           host: ${{ secrets.HOST_IP }}
           username: ${{ secrets.SSH_USERNAME }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           script: |
-            # Ensure we're in the correct directory on the Droplet
             cd /root/nexus_orchestrator_project/
-
+            
             # --- Secret Management for .env file ---
-            # Re-create the .env file on the Droplet if it doesn't exist
-            # You'll need to manually manage the content of this .env file
-            # or pass its contents as a separate secret if you want to automate this more.
-            # For simplicity here, we assume it's stable on the Droplet,
-            # or you'll manually sync it if it changes.
-            # Alternatively, you could pass it as a secret:
-            # echo "${{ secrets.DOT_ENV_CONTENT }}" > .env
-
-            # Log in to GHCR on the Droplet (needed to pull private images)
+            # Re-create the .env file using: echo "CONTENT" > .env
+            # You can pass .env contents as DOT_ENV_CONTENT secret
+            
             docker login ghcr.io -u ${{ github.actor }} -p ${{ secrets.CR_PAT }}
-
             # Pull the latest images from GHCR
             docker-compose pull
 
