@@ -1,0 +1,67 @@
+import React from 'react';
+import { FileMetadataResponse } from '../types';
+import { formatDate, formatFileSize, highlightText } from '../utils/helpers'; // Assuming helpers are available
+
+interface ResultsDisplayProps {
+  results: FileMetadataResponse[];
+  searchQuery?: string; // Optional: for highlighting search terms
+}
+
+const ResultsDisplay: React.FC<ResultsDisplayProps> = ({ results, searchQuery = '' }) => {
+  if (results.length === 0) {
+    return (
+      <div className="bg-white p-6 rounded-lg shadow-md text-center text-gray-500">
+        No results to display.
+      </div>
+    );
+  }
+
+  return (
+    <div className="bg-white p-6 rounded-lg shadow-md">
+      <div className="overflow-x-auto">
+        <table className="min-w-full bg-white border border-gray-200 rounded-lg">
+          <thead>
+            <tr className="bg-gray-50 border-b">
+              <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Filename</th>
+              <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Size</th>
+              <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Type</th>
+              <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Status</th>
+              <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Uploaded On</th>
+              {/* Add more columns if needed based on metadata */}
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-gray-200">
+            {results.map((file) => (
+              <tr key={file.id} className="hover:bg-gray-50">
+                <td className="px-4 py-2 whitespace-nowrap text-sm text-gray-900">
+                  {highlightText(file.filename, searchQuery)} {/* Highlight search term */}
+                </td>
+                <td className="px-4 py-2 whitespace-nowrap text-sm text-gray-500">
+                  {formatFileSize(file.size)}
+                </td>
+                <td className="px-4 py-2 whitespace-nowrap text-sm text-gray-500">
+                  {file.mime_type || 'N/A'}
+                </td>
+                <td className="px-4 py-2 whitespace-nowrap text-sm text-gray-500">
+                  <span className={`px-2 inline-flex text-xs leading-5 font-semibold rounded-full ${
+                      file.status === 'processed' ? 'bg-green-100 text-green-800' :
+                      file.status === 'processing' || file.status === 'enqueued_for_reprocessing' ? 'bg-yellow-100 text-yellow-800' :
+                      file.status === 'failed' ? 'bg-red-100 text-red-800' :
+                      'bg-blue-100 text-blue-800'
+                  }`}>
+                    {file.status.replace(/_/g, ' ')}
+                  </span>
+                </td>
+                <td className="px-4 py-2 whitespace-nowrap text-sm text-gray-500">
+                  {formatDate(file.upload_timestamp)}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+};
+
+export default ResultsDisplay;
